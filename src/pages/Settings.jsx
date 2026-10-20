@@ -1553,9 +1553,13 @@ activeCategory === 'data' ? usersTried
         </Row>
         <Row label={t("Song Transitions")} desc={crossfade.mode === 'automix'
           ? t('AutoMix listens to both songs and blends them like a DJ: on the beat when their tempos are close (the next one sped up or slowed a touch, pitch kept), on the song\'s own fade-out otherwise, with silence at either end cut. Albums play as made.')
-          : crossfade.mode === 'crossfade' ? t('The next song starts before the current one ends, by the amounts below.') : t('Each song plays to its end, then the next starts.')}>
+          : crossfade.mode === 'crossfade'
+            ? t('The next song starts before the current one ends, by the amounts below.')
+            : crossfade.mode === 'gapless'
+              ? t('Seamlessly pre-loads the next song and swaps audio instantly at the exact millisecond the current song finishes, with zero silence or pop between tracks.')
+              : t('Each song plays to its end, then the next starts.')}>
           <div role="radiogroup" aria-label={t("Song transitions")} className="flex rounded-lg bg-card border border-border p-0.5">
-            {[['off', 'Off'], ['crossfade', 'Crossfade'], ['automix', 'AutoMix']].map(([value, label]) => (
+            {[['off', 'Off'], ['gapless', 'Gapless'], ['crossfade', 'Crossfade'], ['automix', 'AutoMix']].map(([value, label]) => (
               <button key={value} type="button" role="radio" aria-checked={crossfade.mode === value} onClick={() => set('song_transitions', value)}
                 className={`px-3 py-1 rounded-md text-xs transition-colors ${crossfade.mode === value ? 'bg-accent text-base font-medium' : 'text-muted hover:text-white'}`}>
                 {t(label)}

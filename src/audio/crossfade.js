@@ -17,16 +17,17 @@ const seconds = (value, fallback, max) => {
   return Number.isFinite(n) && n >= 0 ? Math.min(n, max) : fallback
 }
 
-export const SONG_TRANSITIONS = ['off', 'crossfade', 'automix']
+export const SONG_TRANSITIONS = ['off', 'gapless', 'crossfade', 'automix']
 
 /**
- * Settings → Playback → Song Transitions: 'off', 'crossfade' (the timings
+ * Settings → Playback → Song Transitions: 'off', 'gapless', 'crossfade' (the timings
  * below) or 'automix' (src/audio/automix.js). Before the setting existed, a
  * crossfade length above zero meant crossfade.
  */
 export function songTransitions(settings = {}) {
   if (SONG_TRANSITIONS.includes(settings?.song_transitions)) return settings.song_transitions
-  return seconds(settings?.crossfade_seconds, 0, 30) > CROSSFADE_MIN_S ? 'crossfade' : 'off'
+  if (seconds(settings?.crossfade_seconds, 0, 30) > CROSSFADE_MIN_S) return 'crossfade'
+  return 'gapless'
 }
 
 /** Crossfade options from the stored settings (`crossfade_*` keys, `song_transitions`, `automix_same_album`). */
@@ -35,6 +36,7 @@ export function readCrossfadeSettings(settings = {}) {
   const length = seconds(settings?.crossfade_seconds, CROSSFADE_DEFAULTS.beforeEnd, 30)
   return {
     mode,
+    gapless: mode === 'gapless',
     automix: mode === 'automix',
     automixSameAlbum: settings?.automix_same_album === '1',
     // Crossfading only in its own mode (a length left set from before doesn't count otherwise).

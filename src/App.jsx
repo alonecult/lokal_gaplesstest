@@ -70,7 +70,7 @@ import TvController from './tv/TvController'
 const ADDON_ACCESS_ERROR = /VERIFY_REQUIRED|verif|log\s*in|sign\s*in|unauthori[sz]ed|not authenticated/i
 
 import { playbackAvailability, playbackFallbackMessage, resolveRecommendationTracks } from './recommendations'
-import { isAudioEventForTrack, replaceAudioSource } from './playerAudio'
+import { isAudioEventForTrack, replaceAudioSource, preloadAudioSource, cancelGaplessPreload, swapGainsSeamlessly } from './playerAudio'
 import { handleLiveSeek } from './liveSeek'
 import { useMusicVideoView } from './musicVideo'
 import { skipUnavailableRecommendation } from './recommendationPlayback'
@@ -125,9 +125,16 @@ const MIX_FILTER_OPEN_HZ = 10
 
 /** The song that plays after the current one in `state`'s queue (shuffle order when shuffled), or null. */
 function upcomingTrack(state) {
-  const { shuffle, shuffleQueue, shuffleIndex, queue, queueIndex } = state
-  if (shuffle && shuffleQueue.length > 0) return shuffleIndex + 1 < shuffleQueue.length ? shuffleQueue[shuffleIndex + 1] : null
-  return queueIndex + 1 < queue.length ? queue[queueIndex + 1] : null
+  const { shuffle, shuffleQueue, shuffleIndex, queue, queueIndex, repeat } = state
+  if (repeat === 'one') return null
+  if (shuffle && shuffleQueue.length > 0) {
+    if (shuffleIndex + 1 < shuffleQueue.length) return shuffleQueue[shuffleIndex + 1]
+    if (repeat === 'all' && shuffleQueue.length > 0) return shuffleQueue[0]
+    return null
+  }
+  if (queueIndex + 1 < queue.length) return queue[queueIndex + 1]
+  if (repeat === 'all' && queue.length > 0) return queue[0]
+  return null
 }
 
 const EQ_AUDIO_BANDS = [
@@ -568,6 +575,12 @@ export default function App() {
   const lastfmScrobbleCheckRef = useRef(null)
   const listenbrainzSubmittedPlaybackKeyRef = useRef(null)
   const listenbrainzNowPlayingKeyRef = useRef(null)
+
+  // Gapless playback refs: silent preloading and millisecond instantaneous deck swapping
+  const gaplessPreloadTrackRef = useRef(null)
+  const gaplessPreloadElementRef = useRef(null)
+  const isGaplessTransitionRef = useRef(null)
+  const isPreloadingRef = useRef(false)
 
   const [updateState, setUpdateState] = useState({
     status: 'idle',
@@ -1381,12 +1394,13 @@ export default function App() {
       return state.activeAudioElement === 'primary' ? audioRef.current : cfAudioRef.current
     }
 
-    if (audioRef.current && !isStationTrack(currentTrack) && typeof navigator.mediaSession.setPositionState === 'function') {
+    const activeEl = getActiveAudio()
+    if (activeEl && !isStationTrack(currentTrack) && typeof navigator.mediaSession.setPositionState === 'function') {
       try {
         navigator.mediaSession.setPositionState({
-          duration: audioRef.current.duration || 0,
-          playbackRate: audioRef.current.playbackRate || 1,
-          position: audioRef.current.currentTime || 0
+          duration: activeEl.duration || 0,
+          playbackRate: activeEl.playbackRate || 1,
+          position: activeEl.currentTime || 0
         })
       } catch {}
     }
@@ -2219,8 +2233,138 @@ export default function App() {
     return plan
   }, [])
 
+  const cancelCurrentGaplessPreload = useCallback(() => {
+    if (!gaplessPreloadTrackRef.current) return
+    const activeSide = usePlayerStore.getState().activeAudioElement
+    const inactiveEl = activeSide === 'primary' ? cfAudioRef.current : audioRef.current
+    if (inactiveEl) cancelGaplessPreload(inactiveEl)
+    gaplessPreloadTrackRef.current = null
+    gaplessPreloadElementRef.current = null
+    isPreloadingRef.current = false
+  }, [])
+
+  const preloadUpcomingTrack = useCallback((nextTrack) => {
+    if (!nextTrack || isCrossfadingRef.current || isPreloadingRef.current) return
+    if (gaplessPreloadTrackRef.current?.id === nextTrack.id) return
+    if (!audioRef.current || !cfAudioRef.current) return
+    if (isStationTrack(nextTrack)) return
+
+    const activeSide = usePlayerStore.getState().activeAudioElement
+    const inactiveEl = activeSide === 'primary' ? cfAudioRef.current : audioRef.current
+    const inactiveGain = activeSide === 'primary' ? cfGainNodeRef.current : gainNodeRef.current
+    if (!inactiveEl) return
+
+    const src = audioSrcFor(nextTrack)
+    if (!src) return
+
+    // Ensure the preloading element produces zero sound in the audio graph
+    if (inactiveGain && audioCtxRef.current) {
+      try {
+        inactiveGain.gain.setValueAtTime(0, audioCtxRef.current.currentTime)
+      } catch {}
+    }
+
+    isPreloadingRef.current = true
+    gaplessPreloadTrackRef.current = nextTrack
+    gaplessPreloadElementRef.current = activeSide === 'primary' ? 'cf' : 'primary'
+
+    applyReplayGainToElement(inactiveEl, nextTrack)
+    preloadAudioSource(inactiveEl, src, nextTrack.id)
+
+    const onCanPlay = () => {
+      inactiveEl.removeEventListener('canplay', onCanPlay)
+      isPreloadingRef.current = false
+    }
+    inactiveEl.addEventListener('canplay', onCanPlay, { once: true })
+  }, [applyReplayGainToElement])
+
+  const performGaplessSwap = useCallback(() => {
+    const nextTrack = gaplessPreloadTrackRef.current
+    if (!nextTrack || isCrossfadingRef.current) return false
+
+    const isPrimaryActive = usePlayerStore.getState().activeAudioElement === 'primary'
+    const fadeOutEl = isPrimaryActive ? audioRef.current : cfAudioRef.current
+    const fadeInEl = isPrimaryActive ? cfAudioRef.current : audioRef.current
+    const fadeOutGain = isPrimaryActive ? gainNodeRef.current : cfGainNodeRef.current
+    const fadeInGain = isPrimaryActive ? cfGainNodeRef.current : gainNodeRef.current
+
+    if (!fadeInEl || !fadeOutEl) return false
+    if (fadeInEl.readyState < 2 && !fadeInEl.duration) {
+      cancelCurrentGaplessPreload()
+      return false
+    }
+
+    const nextSide = isPrimaryActive ? 'cf' : 'primary'
+    const ctx = audioCtxRef.current
+    const vol = volumeRef.current
+
+    // 1. Mark transition so currentTrack effect does not tear down playback
+    isGaplessTransitionRef.current = nextTrack.id
+
+    // 2. Play preloaded element immediately with zero delay
+    fadeInEl.dataset.lokalTrackId = String(nextTrack.id)
+    fadeInEl.dataset.lokalTrackPending = ''
+    fadeInEl.dataset.lokalGaplessPreload = ''
+
+    try { fadeInEl.playbackRate = playbackSpeed() } catch {}
+
+    const playPromise = fadeInEl.play()
+    if (playPromise) playPromise.catch(() => {})
+
+    // 3. Instant gain swap with 3ms micro-ramp to eliminate audible DC pop
+    if (ctx && fadeOutGain && fadeInGain) {
+      swapGainsSeamlessly(ctx, fadeOutGain, fadeInGain, vol, 0.003)
+    }
+
+    // 4. Clean up the finished element
+    pauseSuppressRef.current = true
+    try {
+      fadeOutEl.pause()
+      fadeOutEl.removeAttribute('src')
+      fadeOutEl.load()
+    } catch {}
+    fadeOutEl.dataset.lokalTrackPending = ''
+    fadeOutEl.dataset.lokalTrackId = ''
+    setTimeout(() => { pauseSuppressRef.current = false }, 200)
+
+    // 5. Update local tracking refs
+    prevTrackIdRef.current = currentTrackRef.current?.id || null
+    currentTrackRef.current = nextTrack
+    gaplessPreloadTrackRef.current = null
+    gaplessPreloadElementRef.current = null
+    isPreloadingRef.current = false
+
+    // 6. Synchronize UI state and store
+    flushTime(prevTrackIdRef.current)
+    beginLastfmPlayback(nextTrack)
+
+    setActiveAudioElement(nextSide)
+    activeElementRef.current = nextSide
+
+    const state = usePlayerStore.getState()
+    const nextIdx = state.shuffle ? state.shuffleIndex + 1 : state.queueIndex + 1
+    const nextHistory = [...(state.playHistory || []), nextTrack.id]
+
+    usePlayerStore.setState({
+      currentTrack: nextTrack,
+      queueIndex: !state.shuffle ? nextIdx : state.queueIndex,
+      shuffleIndex: state.shuffle ? nextIdx : state.shuffleIndex,
+      isPlaying: true,
+      progress: 0,
+      duration: Number(nextTrack.duration) || (fadeInEl.duration && !isNaN(fadeInEl.duration) ? fadeInEl.duration : 0),
+      activeAudioElement: nextSide,
+      playHistory: nextHistory,
+      futureHistory: []
+    })
+
+    startTimer()
+    sendListenBrainzNowPlaying()
+    return true
+  }, [cancelCurrentGaplessPreload, flushTime, beginLastfmPlayback, setActiveAudioElement, startTimer, sendListenBrainzNowPlaying])
+
   const triggerCrossfade = useCallback((nextTrack, plan = null) => {
     if (isCrossfadingRef.current) return
+    cancelCurrentGaplessPreload()
     if (!cfAudioRef.current || !audioRef.current || !nextTrack || !audioCtxRef.current) return
     if (!gainNodeRef.current || !cfGainNodeRef.current) return
     if (!fadeGainRef.current.primary || !fadeGainRef.current.cf) return
@@ -2447,6 +2591,13 @@ export default function App() {
       else return
     }
 
+    if (currentTrack?.id && isGaplessTransitionRef.current === currentTrack.id) {
+      isGaplessTransitionRef.current = null
+      return
+    }
+
+    cancelCurrentGaplessPreload()
+
     if (castActive) {
       // Casting: the TV plays. Both players are parked, so nothing here makes
       // a sound (a stray play() has no source to play).
@@ -2608,7 +2759,7 @@ export default function App() {
     }
     start()
     return () => { cancelled = true; el.dataset.fallbackPending = ''; el.dataset.lokalTrackPending = '' }
-  }, [currentTrack?.id, currentTrack?.file_path, playbackRetryNonce, castActive, cancelCrossfade, beginLastfmPlayback, recoverOnlinePlayback, setIsBuffering, applyReplayGainToElement])
+  }, [currentTrack?.id, currentTrack?.file_path, playbackRetryNonce, castActive, cancelCrossfade, cancelCurrentGaplessPreload, beginLastfmPlayback, recoverOnlinePlayback, setIsBuffering, applyReplayGainToElement])
 
   useEffect(() => {
     if (!api.isElectron) return
@@ -2707,8 +2858,15 @@ export default function App() {
     const state = usePlayerStore.getState()
     const cf = state.crossfade?.beforeEnd || 0
     const remaining = dur - cur
+    const mode = state.crossfade?.mode || (state.crossfade?.automix ? 'automix' : cf > CROSSFADE_MIN_S ? 'crossfade' : 'gapless')
+    const gaplessActive = mode === 'gapless' || (mode === 'automix' && !state.crossfade?.automixSameAlbum)
 
-    if (state.crossfade?.automix && state.repeat !== 'one') {
+    // Instant gapless swap when song reaches the exact end (e.g. <= 25ms remaining) and preload is ready:
+    if (dur > 0 && remaining <= 0.025 && gaplessPreloadTrackRef.current && state.repeat !== 'one' && gaplessActive) {
+      if (performGaplessSwap()) return
+    }
+
+    if (mode === 'automix' && state.repeat !== 'one') {
       // AutoMix: the transition its plan says, loaded ahead and started on time.
       const nextTrack = upcomingTrack(state)
       const current = currentTrackRef.current
@@ -2721,10 +2879,17 @@ export default function App() {
           if (plan === AUTOMIX_FALLBACK) {
             // Planning failed or was too slow: an ordinary crossfade instead.
             if (remaining <= Math.max(CROSSFADE_MIN_S, state.crossfade?.fadeOut || cf || AUTOMIX_FALLBACK_S)) triggerCrossfade(nextTrack)
-          } else if (plan && cur >= plan.start - AUTOMIX_PRELOAD_S) triggerCrossfade(nextTrack, plan)
+          } else if (plan && cur >= plan.start - AUTOMIX_PRELOAD_S) {
+            triggerCrossfade(nextTrack, plan)
+          } else if (!plan && gaplessActive && remaining <= 10 && remaining > 0.05) {
+            // AutoMix continues on same album: preload gaplessly
+            if (!gaplessPreloadTrackRef.current && !isCrossfadingRef.current) {
+              preloadUpcomingTrack(nextTrack)
+            }
+          }
         }
       }
-    } else if (state.repeat !== 'one' && cf > CROSSFADE_MIN_S && remaining <= cf && remaining > 0.3) {
+    } else if (mode === 'crossfade' && state.repeat !== 'one' && cf > CROSSFADE_MIN_S && remaining <= cf && remaining > 0.3) {
       const { shuffle, shuffleQueue, shuffleIndex, queue, queueIndex } = state
       let nextTrack = null
       
@@ -2735,10 +2900,18 @@ export default function App() {
       }
       
       if (nextTrack) triggerCrossfade(nextTrack)
+    } else if (mode === 'gapless' && state.repeat !== 'one' && remaining <= 10 && remaining > 0.05) {
+      // Gapless: Silently pre-load the next song in the queue when current song has roughly 5 to 10 seconds remaining
+      const nextTrack = upcomingTrack(state)
+      if (nextTrack && !gaplessPreloadTrackRef.current && !isCrossfadingRef.current) {
+        preloadUpcomingTrack(nextTrack)
+      }
+    } else if ((remaining > 15 || mode === 'off') && gaplessPreloadTrackRef.current) {
+      cancelCurrentGaplessPreload()
     }
 
     topUpRelated()
-  }, [triggerCrossfade, isEventFromActive, topUpRelated, automixAnalysis, automixPlanFor])
+  }, [triggerCrossfade, isEventFromActive, topUpRelated, automixAnalysis, automixPlanFor, performGaplessSwap, preloadUpcomingTrack, cancelCurrentGaplessPreload])
 
   const handlePrimaryDurationChange = useCallback((e) => {
     if (isEventFromActive(e) && !isStationTrack(usePlayerStore.getState().currentTrack)) setDuration(e.target.duration)
@@ -2779,8 +2952,12 @@ export default function App() {
       audioRef.current.currentTime = 0; 
       audioRef.current.play().catch(() => {}) 
     }
-    else autoNext()
-  }, [isEventFromActive, repeat, beginLastfmPlayback, autoNext, stopTimer, flushTime])
+    else {
+      if (!gaplessPreloadTrackRef.current || !performGaplessSwap()) {
+        autoNext()
+      }
+    }
+  }, [isEventFromActive, repeat, beginLastfmPlayback, autoNext, stopTimer, flushTime, performGaplessSwap])
 
   const handleCfEnded = useCallback((e) => {
     if (typeof e.currentTarget?.ended === 'boolean' && !e.currentTarget.ended) return
@@ -2794,8 +2971,12 @@ export default function App() {
       cfAudioRef.current.currentTime = 0; 
       cfAudioRef.current.play().catch(() => {}) 
     }
-    else autoNext()
-  }, [isEventFromActive, repeat, beginLastfmPlayback, autoNext, stopTimer, flushTime])
+    else {
+      if (!gaplessPreloadTrackRef.current || !performGaplessSwap()) {
+        autoNext()
+      }
+    }
+  }, [isEventFromActive, repeat, beginLastfmPlayback, autoNext, stopTimer, flushTime, performGaplessSwap])
 
   const handleStartDownload = async () => {
     setUpdateState(prev => ({ ...prev, status: 'downloading' }));

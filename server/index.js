@@ -1,3 +1,22 @@
+// In web mode, stub Electron APIs so Node.js doesn't execute the Electron installer
+if (!process.versions?.electron) {
+  const Module = require('module')
+  const origRequire = Module.prototype.require
+  Module.prototype.require = function (id) {
+    if (id === 'electron') {
+      return {
+        ipcMain: { handle: () => {}, on: () => {}, removeHandler: () => {} },
+        app: { getPath: () => require('path').join(process.cwd(), 'data'), isPackaged: false },
+        BrowserWindow: { getAllWindows: () => [] },
+        nativeImage: {},
+        shell: {},
+        session: { fromPartition: () => ({ clearStorageData: async () => {} }) },
+      }
+    }
+    return origRequire.apply(this, arguments)
+  }
+}
+
 const express = require('express')
 const cors = require('cors')
 const path = require('path')
@@ -32,7 +51,6 @@ app.use((req, res, next) => {
   }
   next()
 })
-if (fs.existsSync(distPath)) app.use(express.static(distPath))
 if (fs.existsSync(publicPath)) app.use(express.static(publicPath))
 
 // API_KEY in .env: every /api route below needs it (see apiKey.js).
@@ -202,20 +220,55 @@ app.get('/remote', (req, res) => {
 })
 
 
-app.get('*', (req, res) => {
-  fs.existsSync(distPath)
-    ? res.sendFile(path.join(distPath, 'index.html'))
-    : res.send('Run npm run build first, or use npm run dev:web')
-})
-
-const PORT = process.env.PORT || 3421
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Lokal Music → http://localhost:${PORT}`);
-}).on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is busy. Server is likely already running.`);
+async function startServer(port = 3000) {
+  const isDev = process.env.NODE_ENV !== 'production' && !packagedElectron
+  if (isDev) {
+    try {
+      const { createServer: createViteServer } = await import('vite')
+      const vite = await createViteServer({
+        server: { middlewareMode: true, host: '0.0.0.0' },
+        appType: 'spa',
+      })
+      app.use(vite.middlewares)
+    } catch (e) {
+      console.warn('[Server] Vite middleware failed to load, falling back to static:', e.message)
+      if (fs.existsSync(distPath)) app.use(express.static(distPath))
+      app.get('*', (req, res) => {
+        fs.existsSync(distPath)
+          ? res.sendFile(path.join(distPath, 'index.html'))
+          : res.status(503).send('Run npm run build first')
+      })
+    }
   } else {
-    console.error('Server Error:', err);
+    if (fs.existsSync(distPath)) app.use(express.static(distPath))
+    app.get('*', (req, res) => {
+      fs.existsSync(distPath)
+        ? res.sendFile(path.join(distPath, 'index.html'))
+        : res.status(503).send('Run npm run build first')
+    })
   }
-});
+
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port, '0.0.0.0', () => {
+      console.log(`Lokal Music → http://0.0.0.0:${port}`)
+      resolve(server)
+    }).on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`Port ${port} is busy. Server is likely already running.`)
+      } else {
+        console.error('Server Error:', err)
+      }
+      reject(err)
+    })
+  })
+}
+
+if (require.main === module) {
+  startServer().catch(err => {
+    console.error('Server startup error:', err)
+    process.exit(1)
+  })
+}
+
 module.exports = app
+module.exports.startServer = startServer

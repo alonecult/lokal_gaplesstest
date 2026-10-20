@@ -1,0 +1,8 @@
+{
+  "name": "Lokal Music",
+  "description": "Local-first music player built with React and Node.js. Listen to your local tracks, radio stations, lyrics, and music library.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

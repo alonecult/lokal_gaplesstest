@@ -37,7 +37,7 @@ compilerPreset.rolldown.filter.id = compilerFilter
 export default defineConfig({
   plugins: [react(), babel({ include: compilerFilter, presets: [compilerPreset] })],
   resolve: { alias: { '@': path.resolve(dirname, 'src') } },
-  base: './',
+  base: '/',
   build: { 
     outDir: 'dist',
     rollupOptions: {
@@ -45,11 +45,8 @@ export default defineConfig({
     }
   },
   server: {
-    port: 5173,
-    proxy: {
-      // xfwd: pass the page's own host on, so the server's same-origin check
-      // (API_KEY, cookie-authorised writes) recognises requests from :5173.
-      '/api': { target: 'http://localhost:3421', changeOrigin: true, xfwd: true }
-    }
+    host: '0.0.0.0',
+    port: 3000,
+    allowedHosts: true
   }
 })
